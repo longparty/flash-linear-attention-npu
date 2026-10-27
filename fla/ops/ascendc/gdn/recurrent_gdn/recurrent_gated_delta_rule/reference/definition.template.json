@@ -1,0 +1,9 @@
+{
+  "name": "recurrent_gated_delta_rule",
+  "inputs": [],
+  "outputs": [
+    "out",
+    "state"
+  ],
+  "reference": ""
+}

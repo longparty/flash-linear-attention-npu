@@ -41,6 +41,16 @@ ACLNN_API aclnnStatus aclnnRecurrentGatedDeltaRuleGetWorkspaceSize(
     const aclTensor *numAcceptedTokens, float scaleValue, aclTensor *out, uint64_t *workspaceSize,
     aclOpExecutor **executor);
 
+// Extended scalar-gate interface (Ascend950); the original ABI remains exported.
+ACLNN_API aclnnStatus aclnnRecurrentGatedDeltaRuleV2GetWorkspaceSize(
+    const aclTensor *query, const aclTensor *key, const aclTensor *value, const aclTensor *beta, aclTensor *stateRef,
+    const aclTensor *actualSeqLengths, const aclTensor *ssmStateIndices, const aclTensor *g, const aclTensor *gk,
+    const aclTensor *numAcceptedTokens, const aclTensor *aLog, const aclTensor *dtBias, float scaleValue,
+    bool useQkL2NormInKernel, bool useGateInKernel, bool useBetaSigmoidInKernel, bool allowNegEigval,
+    aclTensor *out, uint64_t *workspaceSize, aclOpExecutor **executor);
+ACLNN_API aclnnStatus aclnnRecurrentGatedDeltaRuleV2(void *workspace, uint64_t workspaceSize,
+    aclOpExecutor *executor, aclrtStream stream);
+
 /**
  * @brief
  * @param [in] workspace: 在npu device侧申请的workspace内存起址。

@@ -36,6 +36,8 @@ const size_t SSM_STATE_INDICES_INDEX = 6;
 const size_t G_INDEX = 7;
 const size_t GK_INDEX = 8;
 const size_t ACC_TO_INDEX = 9;
+const size_t A_LOG_INDEX = 10;
+const size_t DT_BIAS_INDEX = 11;
 
 void RecurrentGatedDeltaRuleTiling::InitCompileInfo()
 {
@@ -47,6 +49,7 @@ void RecurrentGatedDeltaRuleTiling::InitCompileInfo()
     const auto &ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfoPtr);
     ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, compileInfo_.ubSize);
     compileInfo_.aivNum = ascendcPlatform.GetCoreNumAiv();
+    compileInfo_.isA5 = ascendcPlatform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950;
 
     if (compileInfo_.aivNum <= 0) {
         OP_LOGE(context_->GetNodeName(), "aivNum <= 0");
@@ -279,43 +282,61 @@ ge::graphStatus RecurrentGatedDeltaRuleTiling::GetScale()
                 OP_LOGE(context_->GetNodeName(), "scaleValue must be finite"), return ge::GRAPH_FAILED);
     float scaleValue = *scalePtr;
     tilingData_.scale = scaleValue;
+    const bool *norm = attrs->GetAttrPointer<bool>(1);
+    const bool *gate = attrs->GetAttrPointer<bool>(2);
+    const bool *sigmoid = attrs->GetAttrPointer<bool>(3);
+    const bool *twice = attrs->GetAttrPointer<bool>(4);
+    tilingData_.useQkL2NormInKernel = norm && *norm;
+    tilingData_.useGateInKernel = gate && *gate;
+    tilingData_.useBetaSigmoidInKernel = sigmoid && *sigmoid;
+    tilingData_.allowNegEigval = twice && *twice;
 
     return ge::GRAPH_SUCCESS;
 }
 
 ge::graphStatus RecurrentGatedDeltaRuleTiling::GetStateStrides()
 {
-    auto inputStride = context_->GetInputStride(STATE_INDEX);
-    if (inputStride != nullptr && inputStride->GetDimNum() == RGDR_STATE_DIM_NUM) {
-        tilingData_.stateStride0 = inputStride->GetStride(0);
-        tilingData_.stateStride1 = inputStride->GetStride(1);
-        tilingData_.stateStride2 = inputStride->GetStride(2);
-    } else {
-        tilingData_.stateStride2 = tilingData_.dk;
-        tilingData_.stateStride1 = tilingData_.dv * tilingData_.stateStride2;
-        tilingData_.stateStride0 = tilingData_.nv * tilingData_.stateStride1;
-    }
+    auto read = [&](size_t index, size_t rank, uint64_t *out) {
+        auto stride = context_->GetInputStride(index);
+        uint64_t dense = 1;
+        const auto &shape = context_->GetInputShape(index)->GetOriginShape();
+        for (size_t i = rank; i > 0; --i) {
+            int64_t value = stride && stride->GetDimNum() == rank ? stride->GetStride(i - 1) : dense;
+            if (value <= 0) return false;
+            out[i - 1] = static_cast<uint64_t>(value);
+            dense *= shape.GetDim(i - 1);
+        }
+        return true;
+    };
+    OP_CHECK_IF(!read(QUERY_INDEX,3,tilingData_.queryStrides) || !read(KEY_INDEX,3,tilingData_.keyStrides) ||
+                !read(VALUE_INDEX,3,tilingData_.valueStrides) || !read(STATE_INDEX,4,tilingData_.stateStrides),
+                OP_LOGE(context_->GetNodeName(), "strides must be positive"), return ge::GRAPH_FAILED);
+    OP_CHECK_IF(tilingData_.stateStrides[3] != 1 || tilingData_.stateStrides[2] < tilingData_.dk,
+                OP_LOGE(context_->GetNodeName(), "State inner axis must be contiguous"), return ge::GRAPH_FAILED);
+    tilingData_.stateStride0 = static_cast<uint32_t>(tilingData_.stateStrides[0]);
+    tilingData_.stateStride1 = static_cast<uint32_t>(tilingData_.stateStrides[1]);
+    tilingData_.stateStride2 = static_cast<uint32_t>(tilingData_.stateStrides[2]);
     return ge::GRAPH_SUCCESS;
 }
 
 ge::graphStatus RecurrentGatedDeltaRuleTiling::GetOptionalInput()
 {
-    if (context_->GetOptionalInputDesc(G_INDEX) == nullptr) {
-        tilingData_.hasGama = 0;
-    } else {
-        tilingData_.hasGama = 1;
+    tilingData_.hasGama = context_->GetOptionalInputDesc(G_INDEX) != nullptr;
+    tilingData_.hasGamaK = 0;
+    tilingData_.hasAcceptedTokens = context_->GetOptionalInputDesc(ACC_TO_INDEX) != nullptr;
+    tilingData_.hasDtBias = context_->GetOptionalInputDesc(DT_BIAS_INDEX) != nullptr;
+    OP_CHECK_IF(context_->GetOptionalInputDesc(GK_INDEX) != nullptr,
+                OP_LOGE(context_->GetNodeName(), "gk is reserved"), return ge::GRAPH_FAILED);
+    OP_CHECK_IF(tilingData_.useGateInKernel && (!tilingData_.hasGama || !context_->GetOptionalInputDesc(A_LOG_INDEX)),
+                OP_LOGE(context_->GetNodeName(), "raw gate requires g and A_log"), return ge::GRAPH_FAILED);
+    for (size_t index : {A_LOG_INDEX,DT_BIAS_INDEX}) {
+        auto desc = context_->GetOptionalInputDesc(index);
+        if (!desc) continue;
+        auto shape = context_->GetOptionalInputShape(index);
+        OP_CHECK_IF(desc->GetDataType() != ge::DT_FLOAT || !shape ||
+                    shape->GetOriginShape().GetDimNum() != 1 || shape->GetOriginShape().GetDim(0) != tilingData_.nv,
+                    OP_LOGE(context_->GetNodeName(), "A_log/dt_bias must be FP32 [Nv]"), return ge::GRAPH_FAILED);
     }
-    if (context_->GetOptionalInputDesc(GK_INDEX) == nullptr) {
-        tilingData_.hasGamaK = 0;
-    } else {
-        tilingData_.hasGamaK = 1;
-    }
-    if (context_->GetOptionalInputDesc(ACC_TO_INDEX) == nullptr) {
-        tilingData_.hasAcceptedTokens = 0;
-    } else {
-        tilingData_.hasAcceptedTokens = 1;
-    }
-
     return ge::GRAPH_SUCCESS;
 }
 
@@ -342,6 +363,20 @@ void RecurrentGatedDeltaRuleTiling::PrintTilingData()
 
 ge::graphStatus RecurrentGatedDeltaRuleTiling::CalUbSize()
 {
+    if (compileInfo_.isA5) {
+        OP_CHECK_IF(compileInfo_.ubSize < 208U * 1024U,
+                    OP_LOGE(context_->GetNodeName(), "A5 UB must hold 208 KiB"), return ge::GRAPH_FAILED);
+        tilingData_.ubCalSize = 208U * 1024U;
+        tilingData_.ubRestBytes = 0;
+        tilingData_.vStep = 128;
+        tilingData_.stateOutBufferNum = 2;
+        tilingData_.attnOutBufferNum = 2;
+        return ge::GRAPH_SUCCESS;
+    }
+    OP_CHECK_IF(tilingData_.useQkL2NormInKernel || tilingData_.useGateInKernel ||
+                tilingData_.useBetaSigmoidInKernel || tilingData_.allowNegEigval || tilingData_.stateIndicesWidth ||
+                tilingData_.nk > 256 || tilingData_.nv > 256 || tilingData_.stateStrides[2] != 128,
+                OP_LOGE(context_->GetNodeName(), "extended Recurrent GDN requires Ascend950"), return ge::GRAPH_FAILED);
     RecurrentGatedDeltaRuleTilingProcessor processor(BuildProcessorContext());
     return processor.ProcessUb(tilingData_);
 }

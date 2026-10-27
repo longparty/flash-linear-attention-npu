@@ -25,6 +25,7 @@
 #include <dlfcn.h>
 
 #include <cstdint>
+#include <cstring>
 #include <optional>
 
 namespace {
@@ -54,11 +55,17 @@ using GdrGetWorkspaceFn = int (*)(const aclTensor*, const aclTensor*,
                                   const aclTensor*, const aclTensor*, float,
                                   aclTensor*, uint64_t*, aclOpExecutor**);
 
+using GdrV2GetWorkspaceFn = int (*)(const aclTensor*, const aclTensor*, const aclTensor*, const aclTensor*,
+    aclTensor*, const aclTensor*, const aclTensor*, const aclTensor*, const aclTensor*, const aclTensor*,
+    const aclTensor*, const aclTensor*, float, bool, bool, bool, bool, aclTensor*, uint64_t*, aclOpExecutor**);
+
 constexpr const char* kSchemaRecurrentGdr =
     "npu_recurrent_gated_delta_rule(Tensor query, Tensor key, Tensor value, "
     "Tensor(a!) state, Tensor beta, Tensor actual_seq_lengths, "
     "Tensor ssm_state_indices, Tensor? num_accepted_tokens, Tensor? g, "
-    "Tensor? gk, float scale, int stream) -> Tensor";
+    "Tensor? gk, Tensor? A_log, Tensor? dt_bias, float scale, "
+    "bool use_qk_l2norm_in_kernel, bool use_gate_in_kernel, "
+    "bool use_beta_sigmoid_in_kernel, bool allow_neg_eigval, int stream) -> Tensor";
 
 // Returns the attn output; `state` is an in/out ref, exactly like ctypes.
 Tensor run_recurrent_gated_delta_rule(AtenTensorHandle query,
@@ -72,12 +79,20 @@ Tensor run_recurrent_gated_delta_rule(AtenTensorHandle query,
                                           num_accepted_tokens,
                                       std::optional<AtenTensorHandle> g,
                                       std::optional<AtenTensorHandle> gk,
-                                      double scale, int64_t stream) {
+                                      std::optional<AtenTensorHandle> a_log,
+                                      std::optional<AtenTensorHandle> dt_bias,
+                                      double scale, bool normalize, bool raw_gate,
+                                      bool beta_sigmoid, bool allow_negative, int64_t stream) {
   auto& rt = fla_npu_stable::Runtime::instance();
+  auto get_ws_v2 = reinterpret_cast<GdrV2GetWorkspaceFn>(
+      rt.symbol("aclnnRecurrentGatedDeltaRuleV2GetWorkspaceSize"));
   auto get_ws = reinterpret_cast<GdrGetWorkspaceFn>(
       rt.symbol("aclnnRecurrentGatedDeltaRuleGetWorkspaceSize"));
-  auto launch =
-      reinterpret_cast<LaunchFn>(rt.symbol("aclnnRecurrentGatedDeltaRule"));
+  using SocNameFn = const char* (*)();
+  const char* soc = reinterpret_cast<SocNameFn>(rt.symbol("aclrtGetSocName"))();
+  const bool a5 = soc && std::strstr(soc, "950");
+  auto launch = reinterpret_cast<LaunchFn>(rt.symbol(
+      a5 ? "aclnnRecurrentGatedDeltaRuleV2" : "aclnnRecurrentGatedDeltaRule"));
   // A queued launch reports its failure where no caller can catch it: the next
   // operator call on this thread raises it instead.
   check_async_failure();
@@ -95,14 +110,25 @@ Tensor run_recurrent_gated_delta_rule(AtenTensorHandle query,
   AclTensorView v_g(meta_optional_handle(g), kAclFormatNd);
   AclTensorView v_gk(meta_optional_handle(gk), kAclFormatNd);
   AclTensorView v_accepted(meta_optional_handle(num_accepted_tokens), kAclFormatNd);
+  AclTensorView v_a_log(meta_optional_handle(a_log), kAclFormatNd);
+  AclTensorView v_dt_bias(meta_optional_handle(dt_bias), kAclFormatNd);
   AclTensorView v_out(meta_of(out), kAclFormatNd);
 
   uint64_t workspace_size = 0;
   aclOpExecutor* executor = nullptr;
-  const int get_ret = get_ws(
-      v_query.get(), v_key.get(), v_value.get(), v_beta.get(), v_state.get(),
-      v_seq.get(), v_idx.get(), v_g.get(), v_gk.get(), v_accepted.get(),
-      static_cast<float>(scale), v_out.get(), &workspace_size, &executor);
+  int get_ret;
+  if (a5) {
+    get_ret = get_ws_v2(v_query.get(), v_key.get(), v_value.get(), v_beta.get(), v_state.get(),
+        v_seq.get(), v_idx.get(), v_g.get(), v_gk.get(), v_accepted.get(), v_a_log.get(), v_dt_bias.get(),
+        static_cast<float>(scale), normalize, raw_gate, beta_sigmoid, allow_negative,
+        v_out.get(), &workspace_size, &executor);
+  } else {
+    if (normalize || raw_gate || beta_sigmoid || allow_negative)
+      throw std::runtime_error("extended Recurrent GDN requires Ascend950");
+    get_ret = get_ws(v_query.get(), v_key.get(), v_value.get(), v_beta.get(), v_state.get(),
+        v_seq.get(), v_idx.get(), v_g.get(), v_gk.get(), v_accepted.get(),
+        static_cast<float>(scale), v_out.get(), &workspace_size, &executor);
+  }
   if (get_ret != 0) {
     throw std::runtime_error(
         "fla_npu(stable): aclnnRecurrentGatedDeltaRuleGetWorkspaceSize "
@@ -125,7 +151,7 @@ Tensor run_recurrent_gated_delta_rule(AtenTensorHandle query,
       std::move(v_query), std::move(v_key), std::move(v_value),
       std::move(v_beta), std::move(v_state), std::move(v_seq),
       std::move(v_idx), std::move(v_g), std::move(v_gk),
-      std::move(v_accepted), std::move(v_out));
+      std::move(v_accepted), std::move(v_a_log), std::move(v_dt_bias), std::move(v_out));
   if (enqueue_launch(rt, "aclnnRecurrentGatedDeltaRule", launch, stream,
                      workspace_ptr, workspace_size, executor, held)) {
     return out;
@@ -150,9 +176,9 @@ void boxed_recurrent_gated_delta_rule(StableIValue* stack,
                                       uint64_t num_outputs) {
   // Slots are read positionally: a schema that gained or lost a parameter would
   // shift every following one instead of failing to build.
-  if (num_inputs != 12 || num_outputs != 1) {
+  if (num_inputs != 18 || num_outputs != 1) {
     throw std::runtime_error(
-        "fla_npu(stable): npu_recurrent_gated_delta_rule takes 12 inputs "
+        "fla_npu(stable): npu_recurrent_gated_delta_rule takes 18 inputs "
         "and 1 output, the stack declares " + std::to_string(num_inputs) +
         " and " + std::to_string(num_outputs));
   }
@@ -190,8 +216,14 @@ void boxed_recurrent_gated_delta_rule(StableIValue* stack,
   const auto num_accepted_tokens = to<std::optional<Tensor>>(stack[7]);
   const auto g = to<std::optional<Tensor>>(stack[8]);
   const auto gk = to<std::optional<Tensor>>(stack[9]);
-  const double scale = to<double>(stack[10]);
-  const int64_t stream = to<int64_t>(stack[11]);
+  const auto a_log = to<std::optional<Tensor>>(stack[10]);
+  const auto dt_bias = to<std::optional<Tensor>>(stack[11]);
+  const double scale = to<double>(stack[12]);
+  const bool normalize = to<bool>(stack[13]);
+  const bool raw_gate = to<bool>(stack[14]);
+  const bool beta_sigmoid = to<bool>(stack[15]);
+  const bool allow_negative = to<bool>(stack[16]);
+  const int64_t stream = to<int64_t>(stack[17]);
   Tensor out = run_recurrent_gated_delta_rule(
       query, key, value, state, beta, actual_seq_lengths, ssm_state_indices,
       num_accepted_tokens.has_value()
@@ -200,7 +232,9 @@ void boxed_recurrent_gated_delta_rule(StableIValue* stack,
       g.has_value() ? std::optional<AtenTensorHandle>(g->get()) : std::nullopt,
       gk.has_value() ? std::optional<AtenTensorHandle>(gk->get())
                      : std::nullopt,
-      scale, stream);
+      a_log.has_value() ? std::optional<AtenTensorHandle>(a_log->get()) : std::nullopt,
+      dt_bias.has_value() ? std::optional<AtenTensorHandle>(dt_bias->get()) : std::nullopt,
+      scale, normalize, raw_gate, beta_sigmoid, allow_negative, stream);
   stack[0] = from(out);
 }
 

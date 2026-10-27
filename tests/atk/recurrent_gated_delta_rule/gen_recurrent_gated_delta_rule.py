@@ -1,11 +1,8 @@
-"""Generate the reviewed recurrent_gated_delta_rule ATK case matrix.
+"""Generate the reviewed, three-seed Recurrent GDN accuracy matrix.
 
-The committed accuracy matrix is frozen by detailed-design ID:
-  * 0-99: RGDR-P001 through RGDR-P100
-  * 100-199: RGDR-G001 through RGDR-G100
-
-All positive cases use dimensions aligned to the 32B BF16 transfer block;
-unaligned dimensions are invalid and are covered by op_host interception tests.
+The first 600 cases retain the 200 legacy shape/layout profiles under scalar
+gate semantics; subsequent profiles cover the Ascend950 extended contract.
+Performance and MSS assets are maintained separately from this generator.
 """
 
 from __future__ import annotations
@@ -14,7 +11,9 @@ import argparse
 import json
 import math
 from copy import deepcopy
+from functools import lru_cache
 from pathlib import Path
+from case_matrix import build_extension_profiles
 
 try:
     from atk.case_generator.generator.base_generator import CaseGenerator
@@ -51,6 +50,7 @@ STATE_LAYOUTS = {
     "head_padded",
     "block_padded",
     "head_block_padded",
+    "row_padded",
 }
 INPUT_LAYOUTS = {
     "contiguous",
@@ -59,6 +59,8 @@ INPUT_LAYOUTS = {
     "noncontiguous_qk",
     "noncontiguous_v_gates",
     "noncontiguous_all",
+    "token_head_transposed",
+    "overlapping_qkv",
 }
 
 
@@ -377,17 +379,20 @@ def _finalize(profile: dict, case_id: int) -> dict:
     prefix_tokens = int(spec.get("prefix_tokens", 0))
     seq_lengths = [int(value) for value in spec["seq_lengths"]]
     total_tokens = prefix_tokens + sum(seq_lengths)
-    state_indices = [
-        int(value) for value in spec.get("state_indices", range(total_tokens))
-    ]
-    minimum_blocks = max(state_indices, default=0) + 1
+    width = int(spec.get("state_indices_width", 0))
+    if width:
+        state_indices = [list(range(b*width,(b+1)*width)) for b in range(len(seq_lengths))]
+        minimum_blocks = len(seq_lengths) * width
+    else:
+        state_indices = [int(value) for value in spec.get("state_indices", range(total_tokens))]
+        minimum_blocks = max(state_indices, default=0) + 1
     spec.update(
         {
             "op": OP_NAME,
             "case_id": case_id,
-            "seed": SEED_BASE + case_id,
+            "seed": int(spec.get("seed", SEED_BASE + case_id)),
             "route": "ascendc",
-            "soc": "all",
+            "soc": spec.get("soc", "all"),
             "dtype": "bf16",
             "B": len(seq_lengths),
             "T": total_tokens,
@@ -401,13 +406,6 @@ def _finalize(profile: dict, case_id: int) -> dict:
 
 
 def _validate_specs(specs: list[dict]) -> None:
-    positive_count = sum(str(spec["design_id"]).startswith("RGDR-P") for spec in specs)
-    gva_count = sum(str(spec["design_id"]).startswith("RGDR-G") for spec in specs)
-    expected_ids = [f"RGDR-P{index:03d}" for index in range(1, positive_count + 1)]
-    expected_ids += [f"RGDR-G{index:03d}" for index in range(1, gva_count + 1)]
-    actual_ids = [str(spec["design_id"]) for spec in specs]
-    if actual_ids != expected_ids:
-        raise ValueError("detailed-design IDs are missing, duplicated or out of order")
     names = [str(spec["name"]) for spec in specs]
     if len(set(names)) != len(names):
         raise ValueError("case names must be unique")
@@ -416,19 +414,19 @@ def _validate_specs(specs: list[dict]) -> None:
         if int(spec["case_id"]) != case_id:
             raise ValueError(f"{spec['design_id']}: non-contiguous case_id")
         seq_lengths = [int(value) for value in spec["seq_lengths"]]
-        if not seq_lengths or any(value < 0 or value > 8 for value in seq_lengths):
-            raise ValueError(f"{spec['design_id']}: seq_lengths must be in [0, 8]")
+        if not seq_lengths or any(value < 0 for value in seq_lengths):
+            raise ValueError(f"{spec['design_id']}: seq_lengths must be nonnegative")
         if int(spec.get("prefix_tokens", 0)) < 0:
             raise ValueError(f"{spec['design_id']}: prefix_tokens must be non-negative")
         if int(spec["T"]) <= 0:
             raise ValueError(f"{spec['design_id']}: T must be positive")
-        if not (1 <= int(spec["HK"]) <= int(spec["HV"]) <= 256):
+        if not (1 <= int(spec["HK"]) <= int(spec["HV"])):
             raise ValueError(f"{spec['design_id']}: invalid HK/HV range")
         if int(spec["HV"]) % int(spec["HK"]) != 0:
             raise ValueError(f"{spec['design_id']}: HV must be divisible by HK")
         if int(spec["K"]) != DIM_REQUIRED or int(spec["V"]) != DIM_REQUIRED:
             raise ValueError(f"{spec['design_id']}: K/V must equal {DIM_REQUIRED}")
-        if spec["gate_mode"] not in {"g", "gk", "both"}:
+        if spec["gate_mode"] not in {"g", "none"}:
             raise ValueError(f"{spec['design_id']}: invalid gate_mode")
         if spec["state_dtype"] not in {"bf16", "fp32"}:
             raise ValueError(f"{spec['design_id']}: invalid state_dtype")
@@ -436,8 +434,10 @@ def _validate_specs(specs: list[dict]) -> None:
             raise ValueError(f"{spec['design_id']}: invalid state_layout")
         if spec["input_layout"] not in INPUT_LAYOUTS:
             raise ValueError(f"{spec['design_id']}: invalid input_layout")
-        state_indices = [int(value) for value in spec["state_indices"]]
-        if len(state_indices) != int(spec["T"]):
+        width = int(spec.get("state_indices_width", 0))
+        state_indices = ([int(value) for row in spec["state_indices"] for value in row]
+                         if width else [int(value) for value in spec["state_indices"]])
+        if not width and len(state_indices) != int(spec["T"]):
             raise ValueError(f"{spec['design_id']}: state_indices length must equal T")
         if any(value < 0 or value >= int(spec["block_num"]) for value in state_indices):
             raise ValueError(f"{spec['design_id']}: state index out of range")
@@ -448,13 +448,23 @@ def _validate_specs(specs: list[dict]) -> None:
             accepted = [int(value) for value in accepted]
             if len(accepted) != len(seq_lengths):
                 raise ValueError(f"{spec['design_id']}: accepted_tokens length must equal B")
-            if any(value < 1 or value > seq_lengths[index] for index, value in enumerate(accepted)):
+            if any(seq_lengths[index] and (value < 1 or value > (width or seq_lengths[index]))
+                   for index, value in enumerate(accepted)):
                 raise ValueError(f"{spec['design_id']}: accepted token out of range")
 
 
+@lru_cache(maxsize=1)
 def build_specs() -> list[dict]:
     profiles = _build_positive_profiles() + _build_gva_profiles()
-    specs = [_finalize(profile, case_id) for case_id, profile in enumerate(profiles)]
+    for profile in profiles:
+        profile["name"] = "legacy_shape_" + profile["name"]
+        profile["gate_mode"] = "g"
+    extension = [dict(p, soc="ascend950", dtype="bf16")
+                 for p in build_extension_profiles("full") if "cores" not in p]
+    profiles += extension
+    seeded = [dict(p,seed=seed,name=p["name"]+"_seed"+str(seed))
+              for p in profiles for seed in (20261022,20261023,20261024)]
+    specs = [_finalize(profile, case_id) for case_id, profile in enumerate(seeded)]
     _validate_specs(specs)
     return specs
 

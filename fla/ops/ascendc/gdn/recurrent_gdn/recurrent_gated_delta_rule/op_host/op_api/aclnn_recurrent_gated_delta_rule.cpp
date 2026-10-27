@@ -1,216 +1,169 @@
-/**
- * Copyright (c) 2025 Tianjin University, Ltd.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- */
-
-/*!
- * \file aclnn_recurrent_gated_delta_rule.cpp
- * \brief
- */
-#include <dlfcn.h>
+/** Copyright (c) 2025-2026 Tianjin University, Ltd.
+ * Licensed under CANN Open Software License Agreement Version 2.0. */
 #include "aclnn_recurrent_gated_delta_rule.h"
 #include "recurrent_gated_delta_rule.h"
-
-#include "securec.h"
+#include "acl/acl.h"
 #include "aclnn_kernels/common/op_error_check.h"
-#include "opdev/common_types.h"
+#include "aclnn_kernels/contiguous.h"
 #include "opdev/op_dfx.h"
 #include "opdev/op_executor.h"
 #include "opdev/op_log.h"
-#include "opdev/platform.h"
-
-#include "aclnn_kernels/transdata.h"
-#include "aclnn_kernels/transpose.h"
-#include "aclnn_kernels/contiguous.h"
-#include "aclnn_kernels/reshape.h"
 #include "opdev/tensor_view_utils.h"
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <vector>
 
 using namespace op;
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 namespace {
-constexpr size_t QUERY_DIM_NUM = 3;
-constexpr size_t KEY_DIM_NUM = 3;
-constexpr size_t VALUE_DIM_NUM = 3;
-constexpr size_t BETA_DIM_NUM = 2;
-constexpr size_t STATE_DIM_NUM = 4;
-
-struct RecurrentGatedDeltaRuleParams {
-    // madatory
-    const aclTensor *query {nullptr};
-    const aclTensor *key {nullptr};
-    const aclTensor *value {nullptr};
-    const aclTensor *beta {nullptr};
-    const aclTensor *state {nullptr};
-    const aclTensor *actual_seq_lengths {nullptr};
-    const aclTensor *ssm_state_indices {nullptr};
-    // optional
-    const aclTensor *g {nullptr};
-    const aclTensor *gk {nullptr};
-    const aclTensor *num_accepted_tokens {nullptr};
-    // attrs
-    float scale {1.0f};
-    //output
-    const aclTensor *out {nullptr};
+struct Params {
+    const aclTensor *query, *key, *value, *beta;
+    aclTensor *state;
+    const aclTensor *lengths, *indices, *g, *gk, *accepted, *aLog, *bias;
+    float scale;
+    bool norm, rawGate, sigmoid, twice;
+    aclTensor *out;
 };
 
-// support dtype
-static const std::initializer_list<op::DataType> QKV_TYPE_SUPPORT_LIST = {op::DataType::DT_BF16};
-static const std::initializer_list<op::DataType> STATE_TYPE_SUPPORT_LIST = {op::DataType::DT_BF16,op::DataType::DT_FLOAT};
-static const std::initializer_list<op::DataType> BETA_TYPE_SUPPORT_LIST = {op::DataType::DT_BF16};
-static const std::initializer_list<op::DataType> SEQ_LENS_TYPE_SUPPORT_LIST = {op::DataType::DT_INT32};
-static const std::initializer_list<op::DataType> SSM_TYPE_SUPPORT_LIST = {op::DataType::DT_INT32};
-static const std::initializer_list<op::DataType> G_TYPE_SUPPORT_LIST = {op::DataType::DT_FLOAT};
-static const std::initializer_list<op::DataType> ACC_TO_TYPE_SUPPORT_LIST = {op::DataType::DT_INT32};
-static const std::initializer_list<op::DataType> OUT_TYPE_SUPPORT_LIST = {op::DataType::DT_BF16};
-
-static inline bool CheckNotNull(const RecurrentGatedDeltaRuleParams &params)
+bool ViewValid(const aclTensor *t)
 {
-    // 必选参数
-    OP_CHECK_NULL(params.query, return false);
-    OP_CHECK_NULL(params.key, return false);
-    OP_CHECK_NULL(params.value, return false);
-    OP_CHECK_NULL(params.state, return false);
-    OP_CHECK_NULL(params.beta, return false);
-    OP_CHECK_NULL(params.actual_seq_lengths, return false);
-    OP_CHECK_NULL(params.ssm_state_indices, return false);
-    OP_CHECK_NULL(params.out, return false);
-
+    if (!t) return true;
+    const auto &shape = t->GetViewShape();
+    const auto &strides = t->GetViewStrides();
+    int64_t storage = t->GetStorageShape().GetShapeSize();
+    int64_t last = t->GetViewOffset();
+    if (storage <= 0 || last < 0 || last >= storage || strides.size() != shape.GetDimNum()) return false;
+    for (size_t i = 0; i < shape.GetDimNum(); ++i) {
+        int64_t n = shape.GetDim(i), stride = strides[i];
+        if (n <= 0 || stride <= 0 || (n > 1 && stride > (storage - 1 - last) / (n - 1))) return false;
+        last += (n - 1) * stride;
+    }
     return true;
 }
 
-static inline bool CheckDtypeVaild(const RecurrentGatedDeltaRuleParams &params)
+bool Shape(const aclTensor *t, std::initializer_list<int64_t> sizes)
 {
-    // 检查必选参数数据类型
-    OP_CHECK_DTYPE_NOT_SUPPORT(params.query, QKV_TYPE_SUPPORT_LIST, return false);
-    OP_CHECK_DTYPE_NOT_SUPPORT(params.key, QKV_TYPE_SUPPORT_LIST, return false);
-    OP_CHECK_DTYPE_NOT_SUPPORT(params.value, QKV_TYPE_SUPPORT_LIST, return false);
-    OP_CHECK_DTYPE_NOT_SUPPORT(params.state, STATE_TYPE_SUPPORT_LIST, return false);
-    OP_CHECK_DTYPE_NOT_SUPPORT(params.beta, BETA_TYPE_SUPPORT_LIST, return false);
-    OP_CHECK_DTYPE_NOT_SUPPORT(params.actual_seq_lengths, SEQ_LENS_TYPE_SUPPORT_LIST, return false);
-    OP_CHECK_DTYPE_NOT_SUPPORT(params.ssm_state_indices, SSM_TYPE_SUPPORT_LIST, return false);
-
-    // 检查可选参数数据类型
-    if (params.g != nullptr) {
-        OP_CHECK_DTYPE_NOT_SUPPORT(params.g, G_TYPE_SUPPORT_LIST, return false);
-    }
-    if (params.gk != nullptr) {
-        OP_CHECK_DTYPE_NOT_SUPPORT(params.gk, G_TYPE_SUPPORT_LIST, return false);
-    }
-    if (params.num_accepted_tokens != nullptr) {
-        OP_CHECK_DTYPE_NOT_SUPPORT(params.num_accepted_tokens, ACC_TO_TYPE_SUPPORT_LIST, return false);
-    }
-
-    OP_CHECK_DTYPE_NOT_SUPPORT(params.out, OUT_TYPE_SUPPORT_LIST, return false);
+    if (!t || t->GetViewShape().GetDimNum() != sizes.size()) return false;
+    size_t i = 0;
+    for (auto size : sizes) if (t->GetViewShape().GetDim(i++) != size) return false;
     return true;
 }
 
-static aclnnStatus CheckParams(RecurrentGatedDeltaRuleParams &params)
+bool Type(const aclTensor *t, std::initializer_list<DataType> types)
 {
-    // 检查输入参数是否在支持的数据类型范围内
-    CHECK_RET(CheckDtypeVaild(params), ACLNN_ERR_PARAM_INVALID);
-
-    OP_LOGD("RecurrentGatedDeltaRule check params sucess.");
-
-    return ACLNN_SUCCESS;
+    return !t || std::find(types.begin(), types.end(), t->GetDataType()) != types.end();
 }
 
-static aclnnStatus PreProcess(RecurrentGatedDeltaRuleParams &params)
+bool Check(const Params &p)
 {
-    params.query->SetOriginalShape(params.query->GetViewShape());
-    params.key->SetOriginalShape(params.key->GetViewShape());
-    params.value->SetOriginalShape(params.value->GetViewShape());
-    params.beta->SetOriginalShape(params.beta->GetViewShape());
-    params.state->SetOriginalShape(params.state->GetViewShape());
-    params.actual_seq_lengths->SetOriginalShape(params.actual_seq_lengths->GetViewShape());
-    params.ssm_state_indices->SetOriginalShape(params.ssm_state_indices->GetViewShape());
+    if (!p.query || !p.key || !p.value || !p.beta || !p.state || !p.lengths || !p.indices || !p.out || p.gk)
+        return false;
+    if (!std::isfinite(p.scale) || (p.rawGate && (!p.g || !p.aLog))) return false;
+    for (auto t : {p.query, p.key, p.value, p.beta, static_cast<const aclTensor *>(p.out)}) if (!Type(t, {DataType::DT_BF16})) return false;
+    if (!Type(p.state, {DataType::DT_BF16, DataType::DT_FLOAT})) return false;
+    for (auto t : {p.lengths, p.indices, p.accepted}) if (!Type(t, {DataType::DT_INT32})) return false;
+    for (auto t : {p.g, p.aLog, p.bias}) if (!Type(t, {DataType::DT_FLOAT})) return false;
+    if (p.query->GetViewShape().GetDimNum() != 3 || p.value->GetViewShape().GetDimNum() != 3 ||
+        p.state->GetViewShape().GetDimNum() != 4 || p.lengths->GetViewShape().GetDimNum() != 1) return false;
+    const auto &q = p.query->GetViewShape(), &v = p.value->GetViewShape(), &s = p.state->GetViewShape();
+    int64_t t = q.GetDim(0), nk = q.GetDim(1), nv = v.GetDim(1), blocks = s.GetDim(0);
+    int64_t b = p.lengths->GetViewShape().GetDim(0) - 1;
+    if (t <= 0 || nk <= 0 || nv <= 0 || blocks <= 0 || b <= 0 || nv % nk || q.GetDim(2) != 128 || v.GetDim(2) != 128)
+        return false;
+    if (!Shape(p.key, {t,nk,128}) || !Shape(p.value, {t,nv,128}) || !Shape(p.beta, {t,nv}) ||
+        !Shape(p.state, {blocks,nv,128,128}) || !Shape(p.out, {t,nv,128})) return false;
+    if (p.indices->GetViewShape().GetDimNum() == 1) {
+        if (!Shape(p.indices, {t})) return false;
+    } else if (p.indices->GetViewShape().GetDimNum() == 2) {
+        if (p.indices->GetViewShape().GetDim(0) != b || p.indices->GetViewShape().GetDim(1) <= 0) return false;
+    } else return false;
+    if ((p.g && !Shape(p.g, {t,nv})) || (p.aLog && !Shape(p.aLog, {nv})) ||
+        (p.bias && !Shape(p.bias, {nv})) || (p.accepted && !Shape(p.accepted, {b}))) return false;
+    for (auto x : {p.query,p.key,p.value,p.beta,static_cast<const aclTensor *>(p.state),p.lengths,p.indices,
+                   p.g,p.accepted,p.aLog,p.bias,static_cast<const aclTensor *>(p.out)}) if (!ViewValid(x)) return false;
+    const auto &stride = p.state->GetViewStrides();
+    if (stride[3] != 1 || stride[2] < 128) return false;
+    std::vector<std::pair<int64_t,int64_t>> axes;
+    for (size_t i = 0; i < 4; ++i) if (s.GetDim(i) > 1) axes.emplace_back(stride[i], s.GetDim(i));
+    std::sort(axes.begin(), axes.end());
+    int64_t span = 1;
+    for (auto [step, count] : axes) { if (step < span) return false; span += (count - 1) * step; }
+    return true;
+}
 
+aclnnStatus Workspace(const Params &p, bool extended, uint64_t *workspaceSize, aclOpExecutor **executor)
+{
+    if (!workspaceSize || !executor || !Check(p)) return ACLNN_ERR_PARAM_INVALID;
+    const char *soc = aclrtGetSocName();
+    bool a5 = soc && std::strstr(soc, "950");
+    if (extended && !a5) return ACLNN_ERR_PARAM_INVALID;
+    auto exec = CREATE_EXECUTOR();
+    CHECK_RET(exec.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
+    // aclCreateTensor may describe padded storage as a flat allocation. Shape
+    // inference consumes the logical original shape, rather than that storage.
+    for (auto t : {p.query, p.key, p.value, p.beta, static_cast<const aclTensor *>(p.state),
+                   p.lengths, p.indices, p.g, p.accepted, p.aLog, p.bias}) {
+        if (t) t->SetOriginalShape(t->GetViewShape());
+    }
+    auto view = [&](const aclTensor *t) -> const aclTensor * {
+        if (IsContiguous(t)) return t;
+        return exec->CreateView(t, t->GetViewShape(), t->GetStorageShape(), t->GetViewStrides(), t->GetViewOffset());
+    };
+    auto q = a5 ? view(p.query) : l0op::Contiguous(p.query, exec.get());
+    auto k = a5 ? view(p.key) : l0op::Contiguous(p.key, exec.get());
+    auto v = a5 ? view(p.value) : l0op::Contiguous(p.value, exec.get());
+    auto beta = l0op::Contiguous(p.beta, exec.get());
+    auto lengths = l0op::Contiguous(p.lengths, exec.get());
+    auto indices = l0op::Contiguous(p.indices, exec.get());
+    auto g = p.g ? l0op::Contiguous(p.g, exec.get()) : nullptr;
+    auto accepted = p.accepted ? l0op::Contiguous(p.accepted, exec.get()) : nullptr;
+    auto aLog = p.rawGate ? l0op::Contiguous(p.aLog, exec.get()) : nullptr;
+    auto bias = p.rawGate && p.bias ? l0op::Contiguous(p.bias, exec.get()) : nullptr;
+    aclTensor *state = p.state;
+    if (!IsContiguous(state)) state = exec->CreateView(state, state->GetViewShape(), state->GetStorageShape(),
+                                                     state->GetViewStrides(), state->GetViewOffset());
+    CHECK_RET(q && k && v && beta && lengths && indices && state, ACLNN_ERR_INNER_NULLPTR);
+    auto result = l0op::RecurrentGatedDeltaRule(q,k,v,beta,state,lengths,indices,g,nullptr,accepted,
+        aLog,bias,p.scale,p.norm,p.rawGate,p.sigmoid,p.twice,exec.get());
+    CHECK_RET(result != nullptr, ACLNN_ERR_INNER_NULLPTR);
+    CHECK_RET(l0op::ViewCopy(result, p.out, exec.get()) != nullptr, ACLNN_ERR_INNER_NULLPTR);
+    *workspaceSize = exec->GetWorkspaceSize();
+    exec.ReleaseTo(executor);
     return ACLNN_SUCCESS;
 }
-} // namespace
+}
 
-aclnnStatus aclnnRecurrentGatedDeltaRuleGetWorkspaceSize(const aclTensor *query, const aclTensor *key,
-                                                         const aclTensor *value, const aclTensor *beta,
-                                                         aclTensor *stateRef, const aclTensor *actualSeqLengths,
-                                                         const aclTensor *ssmStateIndices, const aclTensor *g,
-                                                         const aclTensor *gk, const aclTensor *numAcceptedTokens,
-                                                         float scaleValue, aclTensor *out, uint64_t *workspaceSize,
-                                                         aclOpExecutor **executor)
+extern "C" {
+aclnnStatus aclnnRecurrentGatedDeltaRuleV2GetWorkspaceSize(
+    const aclTensor *query,const aclTensor *key,const aclTensor *value,const aclTensor *beta,
+    aclTensor *state,const aclTensor *lengths,const aclTensor *indices,const aclTensor *g,const aclTensor *gk,
+    const aclTensor *accepted,const aclTensor *aLog,const aclTensor *bias,float scale,
+    bool norm,bool rawGate,bool sigmoid,bool twice,aclTensor *out,uint64_t *workspaceSize,aclOpExecutor **executor)
+{
+    L2_DFX_PHASE_1(aclnnRecurrentGatedDeltaRuleV2,
+        DFX_IN(query,key,value,beta,state,lengths,indices,g,gk,accepted,aLog,bias,scale,norm,rawGate,sigmoid,twice),
+        DFX_OUT(state,out));
+    return Workspace({query,key,value,beta,state,lengths,indices,g,gk,accepted,aLog,bias,scale,norm,rawGate,sigmoid,twice,out},
+                     true,workspaceSize,executor);
+}
+aclnnStatus aclnnRecurrentGatedDeltaRuleGetWorkspaceSize(
+    const aclTensor *query,const aclTensor *key,const aclTensor *value,const aclTensor *beta,
+    aclTensor *state,const aclTensor *lengths,const aclTensor *indices,const aclTensor *g,const aclTensor *gk,
+    const aclTensor *accepted,float scale,aclTensor *out,uint64_t *workspaceSize,aclOpExecutor **executor)
 {
     L2_DFX_PHASE_1(aclnnRecurrentGatedDeltaRule,
-                   DFX_IN(query, key, value, beta, stateRef, actualSeqLengths, ssmStateIndices, g, gk,
-                          numAcceptedTokens, scaleValue),
-                   DFX_OUT(stateRef, out));
-
-    auto uniqueExecutor = CREATE_EXECUTOR();
-    CHECK_RET(uniqueExecutor.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
-
-    RecurrentGatedDeltaRuleParams params {query, key, value, beta, stateRef, actualSeqLengths, ssmStateIndices, g, gk, numAcceptedTokens,scaleValue, out};
-
-    CHECK_RET(CheckNotNull(params), ACLNN_ERR_PARAM_INVALID);
-    CHECK_RET(CheckParams(params) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
-    auto ret = PreProcess(params);
-    CHECK_RET(ret == ACLNN_SUCCESS, ret);
-
-    auto query_ = l0op::Contiguous(query, uniqueExecutor.get());
-    auto key_ = l0op::Contiguous(key, uniqueExecutor.get());
-    auto value_ = l0op::Contiguous(value, uniqueExecutor.get());
-    auto beta_ = l0op::Contiguous(beta, uniqueExecutor.get());
-    auto actualSeqLengths_ = l0op::Contiguous(actualSeqLengths, uniqueExecutor.get());
-    auto ssmStateIndices_ = l0op::Contiguous(ssmStateIndices, uniqueExecutor.get());
-    if (g != nullptr) {
-        g = l0op::Contiguous(g, uniqueExecutor.get());
-    }
-    if (gk != nullptr) {
-        gk = l0op::Contiguous(gk, uniqueExecutor.get());
-    }
-    if (numAcceptedTokens != nullptr) {
-        numAcceptedTokens = l0op::Contiguous(numAcceptedTokens, uniqueExecutor.get());
-    }
-    if (!IsContiguous(stateRef)) {
-        stateRef = uniqueExecutor.get()->CreateView(
-            stateRef,
-            stateRef->GetViewShape(),
-            stateRef->GetStorageShape(),
-            stateRef->GetViewStrides(),
-            stateRef->GetViewOffset());
-    }
-
-    auto out_ = l0op::Contiguous(out, uniqueExecutor.get());
-
-    // 调用l0接口
-    auto outRet =
-        l0op::RecurrentGatedDeltaRule(query_, key_, value_, beta_, stateRef, actualSeqLengths_, ssmStateIndices_, g, gk,
-                                      numAcceptedTokens, scaleValue, uniqueExecutor.get());
-    if (outRet == nullptr) {
-        return ACLNN_ERR_INNER_NULLPTR;
-    }
-
-    auto ViewCopyResult = l0op::ViewCopy(outRet, out_, uniqueExecutor.get());
-    if (ViewCopyResult == nullptr) {
-        return ACLNN_ERR_INNER_NULLPTR;
-    }
-
-    // 获取计算过程中需要使用的workspace大小。
-    *workspaceSize = uniqueExecutor->GetWorkspaceSize();
-    uniqueExecutor.ReleaseTo(executor);
-    return ACLNN_SUCCESS;
+        DFX_IN(query,key,value,beta,state,lengths,indices,g,gk,accepted,scale), DFX_OUT(state,out));
+    return Workspace({query,key,value,beta,state,lengths,indices,g,gk,accepted,nullptr,nullptr,scale,false,false,false,false,out},
+                     false,workspaceSize,executor);
 }
-
-aclnnStatus aclnnRecurrentGatedDeltaRule(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
-                                         aclrtStream stream)
+aclnnStatus aclnnRecurrentGatedDeltaRule(void *workspace,uint64_t workspaceSize,aclOpExecutor *executor,aclrtStream stream)
 {
     L2_DFX_PHASE_2(aclnnRecurrentGatedDeltaRule);
-    return CommonOpExecutorRun(workspace, workspaceSize, executor, stream);
+    return CommonOpExecutorRun(workspace,workspaceSize,executor,stream);
 }
-
-#ifdef __cplusplus
+aclnnStatus aclnnRecurrentGatedDeltaRuleV2(void *workspace,uint64_t workspaceSize,aclOpExecutor *executor,aclrtStream stream)
+{
+    L2_DFX_PHASE_2(aclnnRecurrentGatedDeltaRuleV2);
+    return CommonOpExecutorRun(workspace,workspaceSize,executor,stream);
 }
-#endif
+}

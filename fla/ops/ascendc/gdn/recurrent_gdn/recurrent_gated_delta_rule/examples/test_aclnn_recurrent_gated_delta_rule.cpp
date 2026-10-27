@@ -13,6 +13,7 @@
  */
 
 #include <iostream>
+#include <cstring>
 #include <vector>
 #include "acl/acl.h"
 #include "aclnnop/aclnn_recurrent_gated_delta_rule.h"
@@ -41,7 +42,7 @@ int64_t GetShapeSize(const std::vector<int64_t> &shape)
 void PrintOutResult(std::vector<int64_t> &shape, void **deviceAddr)
 {
     auto size = GetShapeSize(shape);
-    std::vector<aclFloat16> resultData(size, 0);
+    std::vector<uint16_t> resultData(size, 0);
     auto ret = aclrtMemcpy(resultData.data(), resultData.size() * sizeof(resultData[0]), *deviceAddr,
                            size * sizeof(resultData[0]), ACL_MEMCPY_DEVICE_TO_HOST);
     CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("copy result from device to host failed. ERROR: %d\n", ret); return);
@@ -49,7 +50,10 @@ void PrintOutResult(std::vector<int64_t> &shape, void **deviceAddr)
         if (i >= 5) { // print the first five data
             break;
         }
-        LOG_PRINT("mean result[%ld] is: %f\n", i, aclFloat16ToFloat(resultData[i]));
+        uint32_t bits = static_cast<uint32_t>(resultData[i]) << 16;
+        float value;
+        std::memcpy(&value, &bits, sizeof(value));
+        LOG_PRINT("BF16 result[%ld] is: %f\n", i, value);
     }
 }
 
@@ -88,8 +92,9 @@ int CreateAclTensor(const std::vector<T> &hostData, const std::vector<int64_t> &
     return ACL_SUCCESS;
 }
 
-int main()
+int main(int argc, char **argv)
 {
+    bool extended = argc > 1 && std::strcmp(argv[1], "--v2") == 0;
     // 1.device/context/stream初始化，参考AscendCL对外接口列表
     // 根据自己的实际device填写deviceId
     int32_t deviceId = 0;
@@ -135,7 +140,8 @@ int main()
     std::vector<int64_t> qkShape = {batchSize * mtp, headKNum, dimK};
     std::vector<int64_t> vShape = {batchSize * mtp, headVNum, dimV};
     std::vector<int64_t> gamaShape = {batchSize * mtp, headVNum};
-    std::vector<int64_t> actSeqLenShape = {batchSize};
+    std::vector<int64_t> actSeqLenShape = {batchSize + 1};
+    std::vector<int64_t> acceptedShape = {batchSize};
     std::vector<int64_t> ssmStaIdShape = {batchSize * mtp};
     std::vector<int16_t> stateRefHostData(GetShapeSize(stateShape));
     std::vector<int16_t> queryHostData(GetShapeSize(qkShape));
@@ -143,7 +149,8 @@ int main()
     std::vector<int16_t> valueHostData(GetShapeSize(vShape));
     std::vector<float> gamaHostData(GetShapeSize(gamaShape));
     std::vector<int16_t> betaHostData(GetShapeSize(gamaShape));
-    std::vector<int32_t> actSeqLenHostData(batchSize, mtp);
+    std::vector<int32_t> actSeqLenHostData(batchSize + 1, mtp);
+    actSeqLenHostData[0] = 0;
     std::vector<int32_t> ssmStaIdHostData(batchSize * mtp);
     std::vector<int32_t> numAccTokHostData(batchSize, 1);
     for (int i = 0; i < stateRefHostData.size(); i++) {
@@ -183,7 +190,7 @@ int main()
     CHECK_RET(ret == ACL_SUCCESS, return ret);
     ret = CreateAclTensor(ssmStaIdHostData, ssmStaIdShape, &ssmStaIdDeviceAddr, aclDataType::ACL_INT32, &ssmStaId);
     CHECK_RET(ret == ACL_SUCCESS, return ret);
-    ret = CreateAclTensor(numAccTokHostData, actSeqLenShape, &numAccTokDeviceAddr, aclDataType::ACL_INT32, &numAccTok);
+    ret = CreateAclTensor(numAccTokHostData, acceptedShape, &numAccTokDeviceAddr, aclDataType::ACL_INT32, &numAccTok);
     CHECK_RET(ret == ACL_SUCCESS, return ret);
     ret = CreateAclTensor(attnOutHostData, vShape, &attnOutDeviceAddr, aclDataType::ACL_BF16, &attnOut);
     CHECK_RET(ret == ACL_SUCCESS, return ret);
@@ -193,8 +200,14 @@ int main()
     float scale = 1.0;
     aclOpExecutor *executor;
     // 调用aclnnRecurrentGatedDeltaRuleGetWorkspaceSize第一段接口
-    ret = aclnnRecurrentGatedDeltaRuleGetWorkspaceSize(query, key, value, beta, stateRef, actSeqLen, ssmStaId, gama,
-                                                       gamak, numAccTok, scale, attnOut, &workspaceSize, &executor);
+    if (extended) {
+        ret = aclnnRecurrentGatedDeltaRuleV2GetWorkspaceSize(query, key, value, beta, stateRef, actSeqLen, ssmStaId,
+            gama, gamak, numAccTok, nullptr, nullptr, scale, true, false, true, false,
+            attnOut, &workspaceSize, &executor);
+    } else {
+        ret = aclnnRecurrentGatedDeltaRuleGetWorkspaceSize(query, key, value, beta, stateRef, actSeqLen, ssmStaId, gama,
+            gamak, numAccTok, scale, attnOut, &workspaceSize, &executor);
+    }
     CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnRecurrentGatedDeltaRuleGetWorkspaceSize failed. ERROR: %d\n", ret);
               return ret);
 
@@ -206,7 +219,8 @@ int main()
     }
 
     // 调用aclnnRecurrentGatedDeltaRule第二段接口
-    ret = aclnnRecurrentGatedDeltaRule(workspaceAddr, workspaceSize, executor, stream);
+    ret = extended ? aclnnRecurrentGatedDeltaRuleV2(workspaceAddr, workspaceSize, executor, stream)
+                   : aclnnRecurrentGatedDeltaRule(workspaceAddr, workspaceSize, executor, stream);
     CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnRecurrentGatedDeltaRule failed. ERROR: %d\n", ret); return ret);
 
     // 4. 同步等待任务执行结束

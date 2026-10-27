@@ -12,7 +12,7 @@
  * \brief
  */
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
-#include "arch35/recurrent_gated_delta_rule.h"
+#include "arch35/recurrent_gated_delta_rule_v2.h"
 #else
 #include "recurrent_gated_delta_rule.h"
 #endif
@@ -20,7 +20,6 @@
 
 
 using namespace AscendC;
-using namespace matmul;
 using namespace RecurrentGatedDeltaRule;
 
 namespace RecurrentGatedDeltaRule {
@@ -44,7 +43,7 @@ struct RGDRDTypeTraits<RGDR_TPL_FP32> {
 template <int D_T_STATE>
 __global__ __aicore__ void
 recurrent_gated_delta_rule(GM_ADDR query, GM_ADDR key, GM_ADDR value, GM_ADDR beta, GM_ADDR state, GM_ADDR cuSeqlens,
-                           GM_ADDR ssmStateIndices, GM_ADDR g, GM_ADDR gk, GM_ADDR numAcceptedTokens, GM_ADDR out,
+                           GM_ADDR ssmStateIndices, GM_ADDR g, GM_ADDR gk, GM_ADDR numAcceptedTokens, GM_ADDR aLog, GM_ADDR dtBias, GM_ADDR out,
                            GM_ADDR stateOut, GM_ADDR workspaceGM, GM_ADDR tilingGM)
 {
     REGISTER_TILING_DEFAULT(RecurrentGatedDeltaRuleTilingData);
@@ -52,9 +51,15 @@ recurrent_gated_delta_rule(GM_ADDR query, GM_ADDR key, GM_ADDR value, GM_ADDR be
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     TPipe pipe;
     using StateType = typename RGDRDTypeTraits<D_T_STATE>::type;
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+    RGDRV2<StateType> op(&tilingData);
+    RGDRV2InitParams initParams{query, key, value, beta, state, cuSeqlens, ssmStateIndices,
+                               g, numAcceptedTokens, aLog, dtBias, out};
+#else
     RGDR<bfloat16_t, bfloat16_t, StateType> op(&tilingData);
     RGDRInitParams initParams{query, key, value, g, gk, beta, state, cuSeqlens,
                               ssmStateIndices, numAcceptedTokens, out, stateOut};
+#endif
     op.Init(initParams, &pipe);
     op.Process();
 }

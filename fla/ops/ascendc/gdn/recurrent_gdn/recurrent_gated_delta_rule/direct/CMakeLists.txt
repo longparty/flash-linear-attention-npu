@@ -1,0 +1,27 @@
+cmake_minimum_required(VERSION 3.16)
+project(rgdn_direct LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_LINK_DEPENDS_USE_LINKER FALSE)
+set(FLA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../..")
+set(CANN_ROOT "$ENV{ASCEND_HOME_PATH}")
+if(NOT CANN_ROOT)
+  set(CANN_ROOT /usr/local/Ascend/cann)
+endif()
+add_executable(rgdn_direct main.cpp)
+target_compile_options(rgdn_direct PRIVATE -O3 -xasc --npu-arch=dav-3510 -DTORCH_MODE -DCATLASS_ARCH=3510)
+target_include_directories(rgdn_direct PRIVATE
+  "${CANN_ROOT}/include" "${CANN_ROOT}/include/ascendc"
+  "${CANN_ROOT}/include/ascendc/basic_api" "${CANN_ROOT}/include/ascendc/highlevel_api"
+  "${CANN_ROOT}/pkg_inc" "${FLA_ROOT}/third_party/catlass/include"
+  "${FLA_ROOT}/fla/ops/ascendc/common")
+target_link_directories(rgdn_direct PRIVATE "${CANN_ROOT}/lib64")
+target_link_libraries(rgdn_direct PRIVATE ascendcl)
+add_executable(rgdn_direct_trace main.cpp)
+get_target_property(RGDN_INCLUDE_DIRS rgdn_direct INCLUDE_DIRECTORIES)
+get_target_property(RGDN_COMPILE_OPTIONS rgdn_direct COMPILE_OPTIONS)
+get_target_property(RGDN_LINK_DIRS rgdn_direct LINK_DIRECTORIES)
+target_include_directories(rgdn_direct_trace PRIVATE ${RGDN_INCLUDE_DIRS})
+target_compile_options(rgdn_direct_trace PRIVATE ${RGDN_COMPILE_OPTIONS})
+target_compile_definitions(rgdn_direct_trace PRIVATE RGDN_ENABLE_TRACE=1)
+target_link_directories(rgdn_direct_trace PRIVATE ${RGDN_LINK_DIRS})
+target_link_libraries(rgdn_direct_trace PRIVATE ascendcl)

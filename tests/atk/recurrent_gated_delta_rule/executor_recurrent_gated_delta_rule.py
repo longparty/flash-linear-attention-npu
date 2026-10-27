@@ -74,6 +74,7 @@ def _build_state(
         "head_padded",
         "block_padded",
         "head_block_padded",
+        "row_padded",
     }:
         raise ValueError(f"{OP_NAME}: unsupported state_layout {state_layout!r}.")
 
@@ -83,20 +84,21 @@ def _build_state(
         if state_layout in {"block_padded", "head_block_padded"}
         else 0
     )
-    head_stride = value_dim * key_dim + head_padding
+    row_stride = key_dim + (16 if state_layout == "row_padded" else 0)
+    head_stride = value_dim * row_stride + head_padding
     block_stride = value_heads * head_stride + block_padding
     storage_offset = key_dim + 1 if state_layout == "head_block_padded" else 0
     storage_size = (
         storage_offset
         + (block_num - 1) * block_stride
         + (value_heads - 1) * head_stride
-        + value_dim * key_dim
+        + (value_dim - 1) * row_stride + key_dim
     )
     storage = torch.empty(storage_size, dtype=dense_state.dtype, device=device)
     state = torch.as_strided(
         storage,
         shape,
-        (block_stride, head_stride, key_dim, 1),
+        (block_stride, head_stride, row_stride, 1),
         storage_offset=storage_offset,
     )
     state.copy_(dense_state)
@@ -118,6 +120,8 @@ def _apply_input_layout(
 ) -> dict[str, Any]:
     layout_names = {
         "contiguous": (),
+        "token_head_transposed": ("query", "key", "value"),
+        "overlapping_qkv": ("query", "key", "value"),
         "noncontiguous_qkv_beta_g": ("query", "key", "value", "beta", "g"),
         "noncontiguous_gk_metadata": (
             "gk",
@@ -137,12 +141,20 @@ def _apply_input_layout(
             "actual_seq_lengths",
             "ssm_state_indices",
             "num_accepted_tokens",
+            "A_log",
+            "dt_bias",
         ),
     }
     if layout not in layout_names:
         raise ValueError(f"{OP_NAME}: unsupported input_layout {layout!r}.")
     for name in layout_names[layout]:
-        inputs[name] = _make_noncontiguous(inputs[name])
+        if layout == "token_head_transposed":
+            inputs[name] = inputs[name].permute(1, 0, 2).contiguous().permute(1, 0, 2)
+        elif layout == "overlapping_qkv":
+            tensor = inputs[name].contiguous()
+            inputs[name] = tensor.as_strided(tensor.shape, (1, 128, 1))
+        else:
+            inputs[name] = _make_noncontiguous(inputs[name])
     return inputs
 
 
@@ -197,18 +209,23 @@ def build_inputs(
     state_calc_dtype = state_dtype
     gate_calc_dtype = torch.float32
 
-    state_indices = [
-        int(value)
-        for value in spec.get("state_indices", list(range(total_tokens)))
-    ]
-    if len(state_indices) != total_tokens:
+    table_width = int(spec.get("state_indices_width", 0))
+    if table_width:
+        if "state_indices" in spec and isinstance(spec["state_indices"][0], list):
+            state_indices = spec["state_indices"]
+        else:
+            state_indices = [list(range(b * table_width, (b + 1) * table_width))
+                             for b in range(len(seq_lengths))]
+    else:
+        state_indices = [int(value) for value in spec.get("state_indices", list(range(total_tokens)))]
+    if not table_width and len(state_indices) != total_tokens:
         raise ValueError(
             f"{OP_NAME}: state_indices must contain T entries, "
             f"got {len(state_indices)} for T={total_tokens}."
         )
 
     gate_mode = str(spec.get("gate_mode", "g"))
-    if gate_mode not in {"g", "gk", "both"}:
+    if gate_mode not in {"g", "gk", "both", "none"}:
         raise ValueError(f"{OP_NAME}: unsupported gate_mode {gate_mode!r}.")
 
     gate_profile = str(spec.get("gate_profile", "random"))
@@ -239,6 +256,9 @@ def build_inputs(
             ).to(gate_calc_dtype)
             g.copy_(values.view(1, -1).expand_as(g))
             _quantize_input_(g, "fp32")
+        if spec.get("use_gate_in_kernel", False):
+            g = _randn((total_tokens, value_heads), "fp32", torch.float32,
+                       device, seed + 6, scale=2.0)
 
     gk = None
     if gate_mode in {"gk", "both"}:
@@ -317,6 +337,14 @@ def build_inputs(
             else _int_tensor(accepted_tokens, device, torch.int32)
         ),
         "scale": float(spec.get("scale", 1.0 / math.sqrt(key_dim))),
+        "use_qk_l2norm_in_kernel": bool(spec.get("use_qk_l2norm_in_kernel", False)),
+        "use_gate_in_kernel": bool(spec.get("use_gate_in_kernel", False)),
+        "use_beta_sigmoid_in_kernel": bool(spec.get("use_beta_sigmoid_in_kernel", False)),
+        "allow_neg_eigval": bool(spec.get("allow_neg_eigval", False)),
+        "A_log": (_randn((value_heads,), "fp32", torch.float32, device, seed + 8, scale=0.5)
+                  if spec.get("use_gate_in_kernel", False) else None),
+        "dt_bias": (_randn((value_heads,), "fp32", torch.float32, device, seed + 9, scale=0.2)
+                    if spec.get("use_gate_in_kernel", False) and spec.get("use_dt_bias", True) else None),
     }
 
     if str(spec.get("data_profile", "random")) == "traceable_gva":
@@ -334,6 +362,25 @@ def build_inputs(
         ).to(torch.bfloat16).to(low_precision_dtype)
         inputs["beta"].copy_(values.view(1, -1).expand_as(inputs["beta"]))
         _quantize_input_(inputs["beta"], "bf16")
+    if spec.get("use_beta_sigmoid_in_kernel", False):
+        inputs["beta"] = _randn((total_tokens, value_heads), "bf16", torch.bfloat16,
+                                device, seed + 5, scale=3.0)
+
+    if str(spec.get("beta_profile", "random")) == "extreme":
+        inputs["beta"].copy_(torch.linspace(-100,100,value_heads,device=device).bfloat16().expand_as(inputs["beta"]))
+    if str(spec.get("beta_profile", "random")) == "zero":
+        inputs["beta"].zero_()
+    if gate_profile == "cancelling_tail":
+        magnitudes = torch.linspace(12, 25, value_heads, device=device)
+        inputs["g"].copy_((-magnitudes).expand_as(inputs["g"]))
+        inputs["A_log"].copy_(magnitudes)
+        if inputs["dt_bias"] is not None:
+            inputs["dt_bias"].zero_()
+    if gate_profile == "extreme" and inputs["g"] is not None:
+        inputs["g"].copy_(torch.linspace(-100,100,value_heads,device=device).expand_as(inputs["g"]))
+    if spec.get("data_profile") == "zero_qk":
+        inputs["query"].zero_()
+        inputs["key"].zero_()
 
     state_profile = str(spec.get("state_profile", "random"))
     if state_profile.startswith("pulse_hv"):
@@ -372,6 +419,12 @@ def run_cpu(spec: dict[str, Any]):
                 num_accepted_tokens=inputs["num_accepted_tokens"],
                 g=inputs["g"],
                 gk=inputs["gk"],
+                use_qk_l2norm_in_kernel=inputs["use_qk_l2norm_in_kernel"],
+                use_gate_in_kernel=inputs["use_gate_in_kernel"],
+                use_beta_sigmoid_in_kernel=inputs["use_beta_sigmoid_in_kernel"],
+                allow_neg_eigval=inputs["allow_neg_eigval"],
+                A_log=inputs["A_log"],
+                dt_bias=inputs["dt_bias"],
             )
             if call_index + 1 < repeat_calls:
                 inputs["state"].copy_(outputs[1])
@@ -400,6 +453,12 @@ def run_npu(spec: dict[str, Any], input_data: InputDataset):
             num_accepted_tokens=inputs["num_accepted_tokens"],
             g=inputs["g"],
             gk=inputs["gk"],
+            use_qk_l2norm_in_kernel=inputs["use_qk_l2norm_in_kernel"],
+            use_gate_in_kernel=inputs["use_gate_in_kernel"],
+            use_beta_sigmoid_in_kernel=inputs["use_beta_sigmoid_in_kernel"],
+            allow_neg_eigval=inputs["allow_neg_eigval"],
+            A_log=inputs["A_log"],
+            dt_bias=inputs["dt_bias"],
         )
     if out is None:
         raise RuntimeError(f"{OP_NAME}: repeat_calls must be positive.")

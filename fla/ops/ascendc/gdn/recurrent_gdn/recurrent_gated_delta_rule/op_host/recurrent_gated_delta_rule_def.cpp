@@ -22,17 +22,20 @@ public:
             .ParamType(REQUIRED)
             .DataType({ge::DT_BF16, ge::DT_BF16})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
+            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND})
+            .IgnoreContiguous();
         this->Input("key")
             .ParamType(REQUIRED)
             .DataType({ge::DT_BF16, ge::DT_BF16})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
+            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND})
+            .IgnoreContiguous();
         this->Input("value")
             .ParamType(REQUIRED)
             .DataType({ge::DT_BF16, ge::DT_BF16})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
+            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND})
+            .IgnoreContiguous();
         this->Input("beta")
             .ParamType(REQUIRED)
             .DataType({ge::DT_BF16, ge::DT_BF16})
@@ -69,6 +72,14 @@ public:
             .DataType({ge::DT_INT32, ge::DT_INT32})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
+        this->Input("A_log")
+            .ParamType(OPTIONAL).DataType({ge::DT_FLOAT, ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
+        this->Input("dt_bias")
+            .ParamType(OPTIONAL).DataType({ge::DT_FLOAT, ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
         this->Output("out")
             .ParamType(REQUIRED)
             .DataType({ge::DT_BF16, ge::DT_BF16})
@@ -81,6 +92,10 @@ public:
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND})
             .IgnoreContiguous();
         this->Attr("scale_value").AttrType(OPTIONAL).Float(1.0);
+        this->Attr("use_qk_l2norm_in_kernel").AttrType(OPTIONAL).Bool(false);
+        this->Attr("use_gate_in_kernel").AttrType(OPTIONAL).Bool(false);
+        this->Attr("use_beta_sigmoid_in_kernel").AttrType(OPTIONAL).Bool(false);
+        this->Attr("allow_neg_eigval").AttrType(OPTIONAL).Bool(false);
 
         OpAICoreConfig aicConfig;
         aicConfig.DynamicCompileStaticFlag(true)

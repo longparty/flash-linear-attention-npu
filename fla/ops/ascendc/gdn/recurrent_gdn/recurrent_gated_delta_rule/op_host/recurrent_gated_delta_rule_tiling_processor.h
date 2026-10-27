@@ -182,7 +182,7 @@ private:
             !CheckDim(valueShape, RGDR_QKV_DIM_NUM, "value") || !CheckDim(betaShape, RGDR_BETA_DIM_NUM, "beta") ||
             !CheckDim(stateShape, RGDR_STATE_DIM_NUM, "state") ||
             !CheckDim(cuSeqlensShape, RGDR_CUSEQLENS_DIM_NUM, "actual_seq_lengths") ||
-            !CheckDim(ssmStateShape, RGDR_SSM_STATE_INDICES_DIM_NUM, "ssm_state_indices")) {
+            (ssmStateShape.GetDimNum() != 1 && ssmStateShape.GetDimNum() != 2)) {
             return ge::GRAPH_FAILED;
         }
 
@@ -190,10 +190,10 @@ private:
             OP_LOGE(ctx_.nodeName, "actual_seq_lengths must contain the prefix and at least one sequence length");
             return ge::GRAPH_FAILED;
         }
-        if (ssmStateShape.GetDim(RGDR_DIM_0) != queryShape.GetDim(RGDR_DIM_0)) {
-            OP_LOGE(ctx_.nodeName,
-                    "ssm_state_indices length must equal T, but got %ld and T is %ld",
-                    ssmStateShape.GetDim(RGDR_DIM_0), queryShape.GetDim(RGDR_DIM_0));
+        if ((ssmStateShape.GetDimNum() == 1 && ssmStateShape.GetDim(0) != queryShape.GetDim(0)) ||
+            (ssmStateShape.GetDimNum() == 2 &&
+             (ssmStateShape.GetDim(0) != cuSeqlensShape.GetDim(0) - 1 || ssmStateShape.GetDim(1) <= 0))) {
+            OP_LOGE(ctx_.nodeName, "ssm_state_indices must be [T] or [B,W] with W>0");
             return ge::GRAPH_FAILED;
         }
 
@@ -222,6 +222,8 @@ private:
         tiling.dv = static_cast<uint32_t>(valueShape.GetDim(RGDR_DIM_2));
         tiling.sBlockNum = static_cast<uint32_t>(stateShape.GetDim(RGDR_DIM_0));
         tiling.b = static_cast<uint32_t>(cuSeqlensShape.GetDim(RGDR_DIM_0) - 1);
+        tiling.stateIndicesWidth = ctx_.ssmStateShape->GetDimNum() == 2 ?
+            static_cast<uint32_t>(ctx_.ssmStateShape->GetDim(1)) : 0;
     }
 
     ge::graphStatus CheckShapeValueRangeAndRule(const RecurrentGatedDeltaRuleTilingData &tiling) const
@@ -232,9 +234,9 @@ private:
                             tiling.t, tiling.nk, tiling.nv, tiling.sBlockNum),
                     return ge::GRAPH_FAILED);
 
-        OP_CHECK_IF(tiling.nk > 256 || tiling.nv > 256 || tiling.dk != RGDR_REQUIRED_DIM || tiling.dv != RGDR_REQUIRED_DIM,
+        OP_CHECK_IF(tiling.dk != RGDR_REQUIRED_DIM || tiling.dv != RGDR_REQUIRED_DIM,
                     OP_LOGE(ctx_.nodeName,
-                            "nk and nv should no bigger than 256, dk and dv should be exactly %u, but nk is %u, "
+                            "dk and dv should be exactly %u, but nk is %u, "
                             "nv is %u, dk is %u, dv is %u",
                             RGDR_REQUIRED_DIM, tiling.nk, tiling.nv, tiling.dk, tiling.dv),
                     return ge::GRAPH_FAILED);

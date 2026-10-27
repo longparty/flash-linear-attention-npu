@@ -63,6 +63,16 @@ struct alignas(8) RecurrentGatedDeltaRuleTilingData {
     uint32_t stateStride0;
  	uint32_t stateStride1;
  	uint32_t stateStride2;
+    uint64_t queryStrides[3] = {};
+    uint64_t keyStrides[3] = {};
+    uint64_t valueStrides[3] = {};
+    uint64_t stateStrides[4] = {};
+    uint32_t stateIndicesWidth = 0;
+    uint32_t useQkL2NormInKernel = 0;
+    uint32_t useGateInKernel = 0;
+    uint32_t useBetaSigmoidInKernel = 0;
+    uint32_t allowNegEigval = 0;
+    uint32_t hasDtBias = 0;
 };
 #pragma pack(pop)
 

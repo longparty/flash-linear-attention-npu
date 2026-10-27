@@ -50,7 +50,7 @@ class FakeTensor:
         self.shape = tuple(shape)
         self.ndim = len(self.shape)
         self.dtype = dtype
-        self.device = types.SimpleNamespace(type=device_type)
+        self.device = types.SimpleNamespace(type=device_type, index=0)
         self._contiguous = contiguous
 
     def is_contiguous(self):
@@ -340,11 +340,11 @@ class AclnnCtypesAbiTest(unittest.TestCase):
         self.assertFalse(captured["args"][13].value)
         self.assertFalse(captured["args"][14].value)
 
-    def test_recurrent_gated_delta_rule_requires_at_least_one_gate_before_launch(self):
+    def test_recurrent_gated_delta_rule_rejects_reserved_gk_before_launch(self):
         with mock.patch.object(ACLNN_CTYPES, "_call_aclnn") as call_aclnn:
             with self.assertRaisesRegex(
-                RuntimeError,
-                r"^npu_recurrent_gated_delta_rule: either g or gk must be provided\.$",
+                ValueError,
+                r"gk is reserved",
             ):
                 ACLNN_CTYPES.npu_recurrent_gated_delta_rule(
                     None,
@@ -354,6 +354,7 @@ class AclnnCtypesAbiTest(unittest.TestCase):
                     beta=None,
                     actual_seq_lengths=None,
                     ssm_state_indices=None,
+                    gk=object(),
                 )
 
         call_aclnn.assert_not_called()
@@ -370,6 +371,11 @@ class AclnnCtypesAbiTest(unittest.TestCase):
             ACLNN_CTYPES._GET_WORKSPACE_ARGTYPES["aclnnRecurrentGatedDeltaRule"],
             expected_argtypes,
         )
+        self.assertEqual(
+            ACLNN_CTYPES._GET_WORKSPACE_ARGTYPES["aclnnRecurrentGatedDeltaRuleV2"],
+            [*([ctypes.c_void_p] * 12), ctypes.c_float, *([ctypes.c_bool] * 4),
+             ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_void_p)],
+        )
 
     def test_recurrent_gated_delta_rule_wrapper_uses_nd_descriptors(self):
         captured = {}
@@ -378,6 +384,7 @@ class AclnnCtypesAbiTest(unittest.TestCase):
         fake_torch.bfloat16 = object()
         fake_torch.float32 = object()
         fake_torch.int32 = object()
+        fake_torch.npu = types.SimpleNamespace(get_device_name=lambda index: "Ascend950PR")
 
         inputs = {
             "query": FakeTensor((5, 4, 128), fake_torch.bfloat16),
@@ -392,7 +399,9 @@ class AclnnCtypesAbiTest(unittest.TestCase):
             "actual_seq_lengths": FakeTensor((3,), fake_torch.int32),
             "ssm_state_indices": FakeTensor((5,), fake_torch.int32),
             "g": FakeTensor((5, 8), fake_torch.float32),
-            "gk": FakeTensor((5, 8, 128), fake_torch.float32),
+            "gk": None,
+            "A_log": FakeTensor((8,), fake_torch.float32),
+            "dt_bias": FakeTensor((8,), fake_torch.float32),
             "num_accepted_tokens": FakeTensor((2,), fake_torch.int32),
         }
 
@@ -407,7 +416,11 @@ class AclnnCtypesAbiTest(unittest.TestCase):
             captured["descriptor_metadata"] = context.descriptor_metadata
             return outputs
 
-        with mock.patch.dict(sys.modules, {"torch": fake_torch}):
+        import importlib
+        validator = importlib.import_module("fla_npu_test_aclnn_ctypes._recurrent_gdn")
+        with mock.patch.dict(sys.modules, {"torch": fake_torch}), mock.patch.object(
+            validator, "validate_recurrent_gdn", return_value=0.125
+        ):
             with mock.patch.object(ACLNN_CTYPES, "_empty", side_effect=fake_empty):
                 with mock.patch.object(ACLNN_CTYPES, "_call_aclnn", side_effect=fake_call_aclnn):
                     output = ACLNN_CTYPES.npu_recurrent_gated_delta_rule(
@@ -422,12 +435,18 @@ class AclnnCtypesAbiTest(unittest.TestCase):
                         num_accepted_tokens=inputs["num_accepted_tokens"],
                         g=inputs["g"],
                         gk=inputs["gk"],
+                        A_log=inputs["A_log"],
+                        dt_bias=inputs["dt_bias"],
+                        use_gate_in_kernel=True,
+                        use_qk_l2norm_in_kernel=True,
+                        use_beta_sigmoid_in_kernel=True,
+                        allow_neg_eigval=True,
                     )
 
         operator_argtypes = ACLNN_CTYPES._GET_WORKSPACE_ARGTYPES[
-            "aclnnRecurrentGatedDeltaRule"
+            "aclnnRecurrentGatedDeltaRuleV2"
         ][:-2]
-        self.assertEqual(captured["name"], "aclnnRecurrentGatedDeltaRule")
+        self.assertEqual(captured["name"], "aclnnRecurrentGatedDeltaRuleV2")
         self.assertEqual(output.shape, inputs["value"].shape)
         self.assertEqual(len(captured["args"]), len(operator_argtypes))
         self.assertEqual([type(arg) for arg in captured["args"]], operator_argtypes)
@@ -444,6 +463,8 @@ class AclnnCtypesAbiTest(unittest.TestCase):
                 "g",
                 "gk",
                 "num_accepted_tokens",
+                "A_log",
+                "dt_bias",
                 "out",
             ],
         )
@@ -451,8 +472,7 @@ class AclnnCtypesAbiTest(unittest.TestCase):
             "descriptor_metadata"
         ]:
             self.assertEqual(format_override, ACLNN_CTYPES.ACL_FORMAT_ND, name)
-            expected_storage_shape = None if name == "state" else tensor.shape
-            self.assertEqual(storage_shape, expected_storage_shape, name)
+            self.assertIsNone(storage_shape, name)
 
     def test_causal_conv1d_bwd_signature_matches_aclnn_prototype(self):
         expected_argtypes = [
